@@ -4,6 +4,7 @@ creating tunnels.
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import socket
 import threading
@@ -12,8 +13,9 @@ import warnings
 from typing import TYPE_CHECKING
 
 import requests
-import uvicorn
 
+from granian._loops import WorkerSignal as GranianWorkerSignal
+from granian.server import Granian, Worker as GranianWorker
 from gradio.exceptions import ServerFailedToStartError
 from gradio.routes import App
 from gradio.tunneling import Tunnel
@@ -29,24 +31,106 @@ LOCALHOST_NAME = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
 GRADIO_API_SERVER = "https://api.gradio.app/v2/tunnel-request"
 
 
-class Server(uvicorn.Server):
-    def install_signal_handlers(self):
+class ServerWorker(GranianWorker):
+    def _spawn(self, target, args):
+        self.proc = threading.Thread(target=_spawn_asgi_worker, args=args, daemon=True)
+        self.proc.pid = -1
+
+    def _watch(self):
         pass
 
-    def run_in_thread(self):
-        self.thread = threading.Thread(target=self.run, daemon=True)
-        self.thread.start()
-        start = time.time()
-        while not self.started:
-            time.sleep(1e-3)
-            if time.time() - start > 5:
-                raise ServerFailedToStartError(
-                    "Server failed to start. Please check that the port is available."
-                )
+    def terminate(self):
+        pass
+
+
+class Server(Granian):
+    def setup_signals(self):
+        self._th_signal = GranianWorkerSignal()
+
+    def _spawn_proc(self, idx, target, callback_loader, socket_loader):
+        return ServerWorker(
+            parent=self,
+            idx=idx,
+            target=target,
+            args=(
+                idx + 1,
+                callback_loader,
+                socket_loader(),
+                self.loop,
+                self.threads,
+                self.blocking_threads,
+                self.backpressure,
+                self.http,
+                self.http1_settings,
+                self.http2_settings,
+                self.websockets,
+                self.loop_opt,
+                self.log_enabled,
+                self.log_level,
+                self.log_config,
+                self.log_access_format if self.log_access else None,
+                self.ssl_ctx,
+                {'url_path_prefix': self.url_path_prefix},
+                self._th_signal
+            ),
+        )
 
     def close(self):
-        self.should_exit = True
-        self.thread.join()
+        self._th_signal.set()
+        self.signal_handler_interrupt()
+
+
+def _spawn_asgi_worker(
+        worker_id,
+        callback_loader,
+        socket,
+        loop_impl,
+        threads,
+        blocking_threads,
+        backpressure,
+        http_mode,
+        http1_settings,
+        http2_settings,
+        websockets,
+        loop_opt,
+        log_enabled,
+        log_level,
+        log_config,
+        log_access_fmt,
+        ssl_ctx,
+        scope_opts,
+        shutdown_event,
+    ):
+        from granian._futures import future_watcher_wrapper
+        from granian._loops import loops
+        from granian._granian import ASGIWorker
+        from granian.asgi import _callback_wrapper
+        from granian.log import configure_logging
+
+        configure_logging(log_level, log_config, log_enabled)
+
+        loop = loops.get(loop_impl)
+        sfd = socket.fileno()
+        callback = callback_loader()
+
+        wcallback = _callback_wrapper(callback, scope_opts, {}, log_access_fmt)
+        if not loop_opt:
+            wcallback = future_watcher_wrapper(wcallback)
+
+        worker = ASGIWorker(
+            worker_id,
+            sfd,
+            threads,
+            blocking_threads,
+            backpressure,
+            http_mode,
+            http1_settings,
+            http2_settings,
+            websockets,
+            loop_opt,
+            *ssl_ctx,
+        )
+        worker.serve_wth(wcallback, loop, contextvars.copy_context(), shutdown_event)
 
 
 def get_first_available_port(initial: int, final: int) -> int:
@@ -150,18 +234,22 @@ def start_server(
 
             # To avoid race conditions, so we also check if the port by trying to start the uvicorn server.
             # If the port is not available, this will throw a ServerFailedToStartError.
-            config = uvicorn.Config(
-                app=app,
+            server = Server(
+                target=app,
+                interface="asgi",
+                address=host,
                 port=port,
-                host=host,
                 log_level="warning",
-                ssl_keyfile=ssl_keyfile,
-                ssl_certfile=ssl_certfile,
-                ssl_keyfile_password=ssl_keyfile_password,
-                ws_max_size=1024 * 1024 * 1024,  # Setting max websocket size to be 1 GB
+                ssl_cert=ssl_certfile,
+                ssl_key=ssl_keyfile,
+                #ssl_key_password=ssl_keyfile_password,
             )
-            server = Server(config=config)
-            server.run_in_thread()
+            server_thread = threading.Thread(
+                target=server.serve,
+                kwargs={'target_loader': lambda v: v},
+                daemon=True
+            )
+            server_thread.start()
             break
         except (OSError, ServerFailedToStartError):
             pass
